@@ -1,0 +1,38 @@
+[project]
+name = "frace"
+version = "0.1.0"
+description = "F-Race, bunch of python awaitables racing to get fastest response considering exceptions, retries and backoffs"
+authors = [
+    {name = "Harishankar Kumar", email = "hsk@althire.ai"},
+]
+dependencies = [
+    "pydantic>=2.10.5",
+]
+requires-python = ">=3.9"
+readme = "README.md"
+license = {text = "MIT"}
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[project.urls]
+Homepage = "https://github.com/searchX/frace"
+
+[tool.pdm.dev-dependencies]
+dev = [
+    "pytest>=8.3.2",
+    "pytest-asyncio>=0.23.8",
+    "sphinx>=7.4.7",
+    "piccolo-theme>=0.23.0",
+    "m2r2>=0.3.3.post2",
+    "myst-parser>=3.0.1",
+]
+
+[tool.pdm]
+distribution = true
+
+[tool.pdm.scripts]
+test = "pytest ."
+docs = "sh -c 'make -C docs/ clean html && make -C docs/ html'"
+gh = "sh -c 'git push origin --delete gh-pages ; pdm run docs && cp -r docs/_build/html docs/gh-output-html/ && touch docs/gh-output-html/.nojekyll && git add -f docs/gh-output-html && git commit -m 'Deploy' && git subtree push --prefix docs/gh-output-html origin gh-pages && rm -rf docs/gh-output-html'"
