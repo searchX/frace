@@ -32,3 +32,22 @@ async def test_two_buckets_one_function_each(race_caller):
     buckets = [["func_slow"], ["func_fast"]]
     result = await race_caller.call_functions(buckets)
     assert result == "fast"
+
+@pytest.mark.asyncio
+async def test_one_bucket_malfunction(race_caller):
+    async def good():
+        await asyncio.sleep(1)
+        return "good"
+
+    async def bad():
+        raise Exception("Function failed")
+
+    fast_model = FunctionModel(id="good", func=good)
+    slow_model = FunctionModel(id="bad", func=bad)
+
+    race_caller.register_function(fast_model)
+    race_caller.register_function(slow_model)
+
+    buckets = [["good"], ["bad"]]
+    result = await race_caller.call_functions(buckets)
+    assert result == "good"

@@ -78,22 +78,30 @@ class FunctionRaceCaller:
 
         tasks = []
         for func_model, bucket in selected_functions:
-            coro = self._run_function(func_model, bucket)
+            coro = self._run_function(func_model, bucket, [])
             tasks.append(asyncio.create_task(coro))
 
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        pending_tasks = set(tasks)
 
-        # Resolve pending tasks and dynamically update failed functions
-        for task in pending:
-            task.cancel()
+        while pending_tasks:
+            # Await for the first task to complete
+            done, pending = await asyncio.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)
+            
+            # Remove done tasks from the pending tasks
+            pending_tasks = pending
 
-        for task in done:
-            try:
-                result = task.result()
-                logger.info(f"Function succeeded with result: {result}")
-                return result
-            except Exception as e:
-                logger.error(f"Function failed: {e}")
+            for task in done:
+                try:
+                    # Try to get the result of the completed task
+                    result = task.result()
+                    logger.info(f"Function succeeded with result: {result}")
+                    for pending_task in pending:
+                        pending_task.cancel()
+                    return result
+                except Exception as e:
+                    logger.error(f"Function failed: {e}")
+                    # Continue the loop to try the next fastest task
+                    continue
 
         raise FraceException("No function succeeded")
 
@@ -113,7 +121,7 @@ class FunctionRaceCaller:
                 ids.append(func_id)
         return ids
 
-    async def _run_function(self, func_model: FunctionModel, bucket: List[str]):
+    async def _run_function(self, func_model: FunctionModel, bucket: List[str], excluded_model_ids: List[str] = []):
         """
         Executes a function and handles failures by retrying the next available function in the bucket.
         """
@@ -133,12 +141,13 @@ class FunctionRaceCaller:
             await self._handle_failure(func_model)
 
             # Select the next function and retry if available
-            next_func_model = self._select_function(bucket, func_model.id)
+            excluded_model_ids.append(func_model.id)
+            next_func_model = self._select_function(bucket, excluded_model_ids)
             if next_func_model:
-                return await self._run_function(next_func_model, bucket)
+                return await self._run_function(next_func_model, bucket, excluded_model_ids)
             else:
                 logger.error(f"All functions in the bucket have failed.")
-                raise FraceException("No function succeeded in the bucket.")
+                raise FraceException("No function succeeded in current bucket.")
         else:
             # Reset failure state on success
             func_model.failures = 0
@@ -181,13 +190,13 @@ class FunctionRaceCaller:
                     remaining_time = func_model.backoff - (current_time - func_model.last_failure_time)
                     logger.debug(f"Function {func_id} will be reactivated in {remaining_time:.2f} seconds.")
 
-    def _select_function(self, bucket: List[str], exclude_id: str = None):
+    def _select_function(self, bucket: List[str], excluded_model_ids: list[str] = []):
         """
         Selects the first function in the bucket that has not exceeded the max_failures threshold.
         Returns None if all functions in the bucket have failed.
         """
         for func_id in bucket:
-            if exclude_id and func_id == exclude_id:
+            if func_id in excluded_model_ids:
                 continue
             func_model = self.function_models[func_id]
             if func_model.failures < self.max_failures:
