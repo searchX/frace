@@ -1,8 +1,7 @@
 import asyncio
 import logging
 import time
-from typing import Dict, List
-from typing import Any, Callable, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 
 from frace.models import FraceException, FunctionModel
 
@@ -24,8 +23,6 @@ class FunctionRaceCaller:
         self.function_models: Dict[str, FunctionModel] = {}
         # Store buckets of function ids
         self.buckets: List[List[str]] = []
-        # For each bucket, keep track of current function index
-        self.bucket_function_indices: List[int] = []
 
     def register_function(self, func_model: FunctionModel):
         """
@@ -42,7 +39,7 @@ class FunctionRaceCaller:
     async def call_functions(self, buckets: List[List[str]], function_args: Dict[str, Tuple[Any, ...]] = None, function_kwargs: Dict[str, Dict[str, Any]] = None, function_timeouts: Optional[Dict[str, float]] = None):
         """
         Calls one function from each bucket concurrently and returns the result of the first successful call.
-        When functions fail, the caller switches to the next function in the bucket, while marking the failed function!
+        When functions fail, the caller switches to the next function in the bucket, while marking the failed function.
 
         :param buckets: List of lists of function IDs to execute concurrently.
         :param function_args: Optional mapping of function IDs to their positional arguments.
@@ -59,6 +56,9 @@ class FunctionRaceCaller:
         if function_timeouts:
             self.function_timeouts.update(function_timeouts)
 
+        # Handle timeouts and failed functions
+        await self._resolve_failures()
+
         function_args = function_args or {}
         function_kwargs = function_kwargs or {}
         for func_id, args in function_args.items():
@@ -69,24 +69,24 @@ class FunctionRaceCaller:
                 self.function_models[func_id].kwargs = kwargs
 
         self.buckets = buckets
-        if not self.bucket_function_indices or len(self.bucket_function_indices) != len(buckets):
-            self.bucket_function_indices = [0] * len(self.buckets)
 
         selected_functions = []
-        for bucket_idx, bucket in enumerate(self.buckets):
-            func_model = self._select_function(bucket_idx)
-            selected_functions.append((bucket_idx, func_model))
+        for bucket in self.buckets:
+            func_model = self._select_function(bucket)
+            if func_model is not None:
+                selected_functions.append((func_model, bucket))
 
         tasks = []
-        for (bucket_idx, func_model) in selected_functions:
+        for func_model, bucket in selected_functions:
             timeout = self.function_timeouts.get(func_model.id, None)
-            coro = self._run_function(func_model, bucket_idx)
+            coro = self._run_function(func_model, bucket)
             if timeout:
                 coro = asyncio.wait_for(coro, timeout=timeout)
             tasks.append(asyncio.create_task(coro))
 
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
 
+        # Resolve pending tasks and dynamically update failed functions
         for task in pending:
             task.cancel()
 
@@ -100,7 +100,23 @@ class FunctionRaceCaller:
 
         raise FraceException("No function succeeded")
 
-    async def _run_function(self, func_model: FunctionModel, bucket_idx: int):
+    async def get_ids_on_timeout(self):
+        """
+        Gets all the ids of the functions that have timed out/currently failing and bypassed.
+
+        :return: List of ids of the functions that have timed out/currently failing and bypassed
+        :rtype: List[str]
+        """
+        # Resolve if any function has timed out
+        await self._resolve_failures()
+
+        ids = []
+        for func_id, func_model in self.function_models.items():
+            if func_model.failures >= self.max_failures:
+                ids.append(func_id)
+        return ids
+
+    async def _run_function(self, func_model: FunctionModel, bucket: List[str]):
         """
         Executes a function and handles failures by retrying the next available function in the bucket.
         """
@@ -110,18 +126,18 @@ class FunctionRaceCaller:
             raise
         except Exception as e:
             logger.warning(f"Function {func_model.id} failed with error: {e}")
-            await self._handle_failure(func_model, bucket_idx)
-            
+            await self._handle_failure(func_model)
+                
             # Select the next function and retry if available
-            next_func_model = self._select_function(bucket_idx)
+            next_func_model = self._select_function(bucket)
             if next_func_model:
                 timeout = self.function_timeouts.get(next_func_model.id, None)
-                coro = self._run_function(next_func_model, bucket_idx)
+                coro = self._run_function(next_func_model, bucket)
                 if timeout:
                     coro = asyncio.wait_for(coro, timeout=timeout)
                 return await coro
             else:
-                logger.error(f"All functions in bucket {bucket_idx} have failed.")
+                logger.error(f"All functions in the bucket have failed.")
                 raise FraceException("No function succeeded in the bucket.")
         else:
             # Reset failure state on success
@@ -129,30 +145,33 @@ class FunctionRaceCaller:
             func_model.backoff = 1.0
             return result
 
-    async def _handle_failure(self, func_model: FunctionModel, bucket_idx: int):
+    async def _handle_failure(self, func_model: FunctionModel):
         func_model.failures += 1
         func_model.last_failure_time = time.time()
         func_model.backoff *= 2
-        if func_model.failures >= self.max_failures:
-            logger.info(f"Switching to next function in bucket {bucket_idx} after {func_model.failures} failures.")
-            self._switch_to_next_function(bucket_idx)
 
-    def _switch_to_next_function(self, bucket_idx: int):
-        bucket = self.buckets[bucket_idx]
-        current_idx = self.bucket_function_indices[bucket_idx]
-        next_idx = (current_idx + 1) % len(bucket)
-        self.bucket_function_indices[bucket_idx] = next_idx
-
-    def _select_function(self, bucket_idx: int):
+    async def _resolve_failures(self):
         """
-        Selects the next function in the bucket that has not exceeded the max_failures threshold.
+        Updates the state of all failed or timed-out functions to dynamically adjust call behavior.
+        """
+        current_time = time.time()
+        for func_id, func_model in self.function_models.items():
+            if func_model.failures >= self.max_failures:
+                # Check if the backoff period has elapsed
+                if current_time - func_model.last_failure_time > func_model.backoff:
+                    logger.info(f"Reactivating function {func_id} after {func_model.failures} failures.")
+                    func_model.failures = 0
+                    func_model.backoff = 1.0
+                else:
+                    print("Time remaining for function to be reactivated: ", func_model.backoff - (current_time - func_model.last_failure_time))
+
+    def _select_function(self, bucket: List[str]):
+        """
+        Selects the first function in the bucket that has not exceeded the max_failures threshold.
         Returns None if all functions in the bucket have failed.
         """
-        bucket = self.buckets[bucket_idx]
-        for idx in range(len(bucket)):
-            func_id = bucket[(self.bucket_function_indices[bucket_idx] + idx) % len(bucket)]
+        for func_id in bucket:
             func_model = self.function_models[func_id]
             if func_model.failures < self.max_failures:
-                self.bucket_function_indices[bucket_idx] = (self.bucket_function_indices[bucket_idx] + idx) % len(bucket)
                 return func_model
         return None  # All functions have failed

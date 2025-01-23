@@ -27,3 +27,12 @@ async def test_fault_tolerance_two_buckets(race_caller):
     buckets = [["func_fail", "func_fast"], ["func_fail", "func_fast"]]
     result = await race_caller.call_functions(buckets)
     assert result == "fast success"
+
+@pytest.mark.asyncio
+async def test_fault_cycle_back(race_caller, failing_function_model, simple_function_model):
+    race_caller.register_function(failing_function_model)
+    race_caller.register_function(simple_function_model)
+
+    buckets = [["func_fail", "func_fail", "func_fail", "func_fail", "func1"]]
+    result = await race_caller.call_functions(buckets)
+    assert result == "success"

@@ -16,7 +16,7 @@ async def test_two_buckets_one_function_each(race_caller):
         return "fast"
 
     async def slow_function():
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.01)
         return "slow"
 
     fast_model = FunctionModel(id="func_fast", func=fast_function)
@@ -26,5 +26,9 @@ async def test_two_buckets_one_function_each(race_caller):
     race_caller.register_function(slow_model)
 
     buckets = [["func_fast"], ["func_slow"]]
+    result = await race_caller.call_functions(buckets)
+    assert result == "fast"
+
+    buckets = [["func_slow"], ["func_fast"]]
     result = await race_caller.call_functions(buckets)
     assert result == "fast"
