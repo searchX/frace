@@ -101,6 +101,9 @@ class FunctionRaceCaller:
         raise FraceException("No function succeeded")
 
     async def _run_function(self, func_model: FunctionModel, bucket_idx: int):
+        """
+        Executes a function and handles failures by retrying the next available function in the bucket.
+        """
         try:
             result = await func_model.call()
         except asyncio.CancelledError:
@@ -108,16 +111,20 @@ class FunctionRaceCaller:
         except Exception as e:
             logger.warning(f"Function {func_model.id} failed with error: {e}")
             await self._handle_failure(func_model, bucket_idx)
+            
+            # Select the next function and retry if available
             next_func_model = self._select_function(bucket_idx)
-            if next_func_model is not func_model:
+            if next_func_model:
                 timeout = self.function_timeouts.get(next_func_model.id, None)
                 coro = self._run_function(next_func_model, bucket_idx)
                 if timeout:
                     coro = asyncio.wait_for(coro, timeout=timeout)
                 return await coro
             else:
-                raise
+                logger.error(f"All functions in bucket {bucket_idx} have failed.")
+                raise FraceException("No function succeeded in the bucket.")
         else:
+            # Reset failure state on success
             func_model.failures = 0
             func_model.backoff = 1.0
             return result
@@ -137,12 +144,15 @@ class FunctionRaceCaller:
         self.bucket_function_indices[bucket_idx] = next_idx
 
     def _select_function(self, bucket_idx: int):
+        """
+        Selects the next function in the bucket that has not exceeded the max_failures threshold.
+        Returns None if all functions in the bucket have failed.
+        """
         bucket = self.buckets[bucket_idx]
-        for idx, func_id in enumerate(bucket):
+        for idx in range(len(bucket)):
+            func_id = bucket[(self.bucket_function_indices[bucket_idx] + idx) % len(bucket)]
             func_model = self.function_models[func_id]
             if func_model.failures < self.max_failures:
-                self.bucket_function_indices[bucket_idx] = idx
+                self.bucket_function_indices[bucket_idx] = (self.bucket_function_indices[bucket_idx] + idx) % len(bucket)
                 return func_model
-
-        current_func_id = bucket[self.bucket_function_indices[bucket_idx]]
-        return self.function_models[current_func_id]
+        return None  # All functions have failed
