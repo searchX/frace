@@ -78,10 +78,7 @@ class FunctionRaceCaller:
 
         tasks = []
         for func_model, bucket in selected_functions:
-            timeout = self.function_timeouts.get(func_model.id, None)
             coro = self._run_function(func_model, bucket)
-            if timeout:
-                coro = asyncio.wait_for(coro, timeout=timeout)
             tasks.append(asyncio.create_task(coro))
 
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -121,21 +118,24 @@ class FunctionRaceCaller:
         Executes a function and handles failures by retrying the next available function in the bucket.
         """
         try:
-            result = await func_model.call()
+            timeout = self.function_timeouts.get(func_model.id, None)
+            if timeout:
+                result = await asyncio.wait_for(func_model.call(), timeout=timeout)
+            else:
+                result = await func_model.call()
         except asyncio.CancelledError:
             raise
-        except Exception as e:
-            logger.warning(f"Function {func_model.id} failed with error: {e}")
+        except (Exception, asyncio.TimeoutError) as e:
+            if isinstance(e, asyncio.TimeoutError):
+                logger.warning(f"Function {func_model.id} timed out.")
+            else:
+                logger.warning(f"Function {func_model.id} failed with error: {e}")
             await self._handle_failure(func_model)
-                
+
             # Select the next function and retry if available
-            next_func_model = self._select_function(bucket)
+            next_func_model = self._select_function(bucket, func_model.id)
             if next_func_model:
-                timeout = self.function_timeouts.get(next_func_model.id, None)
-                coro = self._run_function(next_func_model, bucket)
-                if timeout:
-                    coro = asyncio.wait_for(coro, timeout=timeout)
-                return await coro
+                return await self._run_function(next_func_model, bucket)
             else:
                 logger.error(f"All functions in the bucket have failed.")
                 raise FraceException("No function succeeded in the bucket.")
@@ -144,6 +144,22 @@ class FunctionRaceCaller:
             func_model.failures = 0
             func_model.backoff = 1.0
             return result
+        
+    async def get_function_remaining_timeout_in_seconds(self, func_id: str):
+        """
+        Gets the timeout in seconds for a function.
+
+        :param func_id: The id of the function.
+        :type func_id: str
+        :return: The timeout in seconds for the function.
+        :rtype: float
+        """
+        timerem = time.time()
+        func_model = self.function_models[func_id]
+        if func_model.failures >= self.max_failures:
+            return func_model.backoff - (timerem - func_model.last_failure_time)
+        else:
+            return 0.0
 
     async def _handle_failure(self, func_model: FunctionModel):
         func_model.failures += 1
@@ -160,17 +176,19 @@ class FunctionRaceCaller:
                 # Check if the backoff period has elapsed
                 if current_time - func_model.last_failure_time > func_model.backoff:
                     logger.info(f"Reactivating function {func_id} after {func_model.failures} failures.")
-                    func_model.failures = 0
-                    func_model.backoff = 1.0
+                    func_model.failures = self.max_failures - 1
                 else:
-                    print("Time remaining for function to be reactivated: ", func_model.backoff - (current_time - func_model.last_failure_time))
+                    remaining_time = func_model.backoff - (current_time - func_model.last_failure_time)
+                    logger.debug(f"Function {func_id} will be reactivated in {remaining_time:.2f} seconds.")
 
-    def _select_function(self, bucket: List[str]):
+    def _select_function(self, bucket: List[str], exclude_id: str = None):
         """
         Selects the first function in the bucket that has not exceeded the max_failures threshold.
         Returns None if all functions in the bucket have failed.
         """
         for func_id in bucket:
+            if exclude_id and func_id == exclude_id:
+                continue
             func_model = self.function_models[func_id]
             if func_model.failures < self.max_failures:
                 return func_model
