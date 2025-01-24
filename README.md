@@ -14,6 +14,11 @@ Welcome to the Frace Project, a powerful Python library designed to execute mult
 
 When dealing with operations that may experience intermittent failures and where getting a result quickly is more important than which function succeeds, Frace is ideal. Its concurrent execution and automatic failover to alternate functions ensure your application remains responsive and reliable.
 
+### Frace at a Glance
+<img src="https://raw.githubusercontent.com/searchX/frace/main/images/frace_executor.png" height="512">
+
+Frace executes one function from each bucket concurrently, allowing multiple functions to run simultaneously, If a function fails, Frace automatically switches to the next available function in the bucket. This process continues until a successful function is found or all functions in the bucket fail.. while execution if any bucket gives a successful response, the execution stops and returns the result.
+
 ## Installation
 
 Install the `frace` package using pip:
